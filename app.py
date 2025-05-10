@@ -9,7 +9,7 @@ import os
 import socket
 from collections import deque
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder='static')
 
 # Use deque with max length to limit memory usage
 intercepted_requests = deque(maxlen=100)
@@ -38,6 +38,7 @@ with open('templates/index.html', 'w') as f:
 <html>
 <head>
     <title>Web Request Inspector</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
     <style>
         body { font-family: Arial, sans-serif; margin: 20px; }
         .container { display: flex; }
@@ -153,24 +154,39 @@ with open('templates/index.html', 'w') as f:
         }
         
         function addRequestToList(req) {
-            const requestList = document.getElementById('requestList');
-            const item = document.createElement('div');
-            item.className = 'request-item';
-            item.innerHTML = `<strong>${req.method}</strong> ${req.url.substring(0, 30)}${req.url.length > 30 ? '...' : ''}`;
-            item.onclick = () => showRequestDetails(req.id);
-            
-            // Add to top of list
-            if (requestList.firstChild) {
-                requestList.insertBefore(item, requestList.firstChild);
-            } else {
-                requestList.appendChild(item);
-            }
-            
-            // Limit items
-            while (requestList.children.length > 100) {
-                requestList.removeChild(requestList.lastChild);
-            }
-        }
+    const requestList = document.getElementById('requestList');
+    const item = document.createElement('div');
+    item.className = 'request-item fade-in';
+    
+    const methodSpan = document.createElement('span');
+    methodSpan.className = `request-method method-${req.method}`;
+    methodSpan.textContent = req.method;
+    
+    const urlSpan = document.createElement('span');
+    urlSpan.className = 'request-url';
+    urlSpan.textContent = req.url.substring(0, 30) + (req.url.length > 30 ? '...' : '');
+    
+    const timeSpan = document.createElement('span');
+    timeSpan.className = 'request-time';
+    timeSpan.textContent = req.timestamp.split(' ')[1]; // Just show time
+    
+    item.appendChild(methodSpan);
+    item.appendChild(urlSpan);
+    item.appendChild(timeSpan);
+    item.onclick = () => showRequestDetails(req.id);
+    
+    // Add to top of list
+    if (requestList.firstChild) {
+        requestList.insertBefore(item, requestList.firstChild);
+    } else {
+        requestList.appendChild(item);
+    }
+    
+    // Limit items
+    while (requestList.children.length > 100) {
+        requestList.removeChild(requestList.lastChild);
+    }
+}
         
         // Load blocked domains
         function loadBlockedDomains() {

@@ -3,6 +3,7 @@
 <html>
 <head>
     <title>Web Request Inspector</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
     <style>
         body { font-family: Arial, sans-serif; margin: 20px; }
         .container { display: flex; }
@@ -17,42 +18,24 @@
         .forge-form { margin-top: 20px; border: 1px solid #ccc; padding: 10px; }
         textarea { width: 100%; height: 100px; }
         .status { background-color: #f0f0f0; padding: 10px; margin: 10px 0; border-radius: 5px; }
-        .instructions { background-color: #e8f4ff; padding: 15px; margin: 15px 0; border-radius: 5px; }
     </style>
 </head>
 <body>
     <h1>Web Request Inspector</h1>
-    
-    <div class="status" id="proxyStatus">
-        Proxy server status: Loading...
-    </div>
-    
-    <div class="instructions">
-        <h3>Setup Instructions:</h3>
-        <ol>
-            <li>Start the proxy server using the button above</li>
-            <li>Configure your browser to use the proxy (HTTP proxy only)</li>
-            <li>Visit HTTP websites to see requests (Note: For security reasons, HTTPS sites will be tunneled but not decoded)</li>
-        </ol>
-        <p><strong>Note:</strong> This tool works best with HTTP sites. HTTPS sites will be tunneled through but contents won't be visible due to encryption.</p>
-    </div>
+    <div class="status" id="proxyStatus">Proxy server status: Loading...</div>
     
     <div class="container">
         <div class="sidebar">
             <h2>Requests</h2>
-            <div class="request-list" id="requestList">
-                <!-- Request items will be added here dynamically -->
-            </div>
+            <div class="request-list" id="requestList"></div>
             
             <div class="blocked-domains">
                 <h2>Blocked Domains</h2>
                 <form id="blockForm">
                     <input type="text" id="domainInput" placeholder="example.com">
-                    <button type="submit">Block Domain</button>
+                    <button type="submit">Block</button>
                 </form>
-                <ul id="blockedDomainsList">
-                    <!-- Blocked domains will be listed here -->
-                </ul>
+                <ul id="blockedDomainsList"></ul>
             </div>
         </div>
         
@@ -64,28 +47,16 @@
             <div class="forge-form">
                 <h2>Forge Request</h2>
                 <form id="forgeForm">
-                    <div>
-                        <label for="method">Method:</label>
-                        <select id="method">
-                            <option value="GET">GET</option>
-                            <option value="POST">POST</option>
-                            <option value="PUT">PUT</option>
-                            <option value="DELETE">DELETE</option>
-                        </select>
-                    </div>
-                    <div>
-                        <label for="url">URL:</label>
-                        <input type="text" id="url" style="width: 100%;" placeholder="https://example.com/api">
-                    </div>
-                    <div>
-                        <label for="headers">Headers (JSON):</label>
-                        <textarea id="headers" placeholder='{"Content-Type": "application/json"}'></textarea>
-                    </div>
-                    <div>
-                        <label for="body">Body:</label>
-                        <textarea id="body" placeholder='{"key": "value"}'></textarea>
-                    </div>
-                    <button type="submit">Send Request</button>
+                    <select id="method">
+                        <option value="GET">GET</option>
+                        <option value="POST">POST</option>
+                        <option value="PUT">PUT</option>
+                        <option value="DELETE">DELETE</option>
+                    </select>
+                    <input type="text" id="url" style="width: 100%;" placeholder="http://example.com/api">
+                    <textarea id="headers" placeholder='{"Content-Type": "application/json"}'></textarea>
+                    <textarea id="body" placeholder='{"key": "value"}'></textarea>
+                    <button type="submit">Send</button>
                 </form>
                 <div id="forgeResponse"></div>
             </div>
@@ -93,21 +64,36 @@
     </div>
     
     <script>
+        // Setup WebSocket for real-time updates
+        const ws = new WebSocket(`ws://${window.location.host}/ws`);
+        ws.onmessage = function(event) {
+            const data = JSON.parse(event.data);
+            if (data.type === 'request') {
+                addRequestToList(data.request);
+            } else if (data.type === 'blocked_domains') {
+                updateBlockedDomains(data.domains);
+            } else if (data.type === 'proxy_status') {
+                updateProxyStatus(data.status);
+            }
+        };
+        
         // Fetch proxy status
         function fetchProxyStatus() {
             fetch('/api/proxy-status')
                 .then(response => response.json())
-                .then(data => {
-                    const statusDiv = document.getElementById('proxyStatus');
-                    statusDiv.innerHTML = `Proxy server status: ${data.running ? 'Running' : 'Stopped'} 
-                                          ${data.running ? `on ${data.host}:${data.port}` : ''}
-                                          <button id="toggleProxy">${data.running ? 'Stop Proxy' : 'Start Proxy'}</button>`;
-                    
-                    document.getElementById('toggleProxy').onclick = () => toggleProxy(data.running);
-                });
+                .then(data => updateProxyStatus(data));
         }
         
-        // Toggle proxy status
+        function updateProxyStatus(status) {
+            const statusDiv = document.getElementById('proxyStatus');
+            statusDiv.innerHTML = `Proxy server status: ${status.running ? 'Running' : 'Stopped'} 
+                                  ${status.running ? `on ${status.host}:${status.port}` : ''}
+                                  <button id="toggleProxy">${status.running ? 'Stop' : 'Start'}</button>`;
+            
+            document.getElementById('toggleProxy').onclick = () => toggleProxy(status.running);
+        }
+        
+        // Toggle proxy
         function toggleProxy(isRunning) {
             fetch('/api/toggle-proxy', {
                 method: 'POST',
@@ -121,42 +107,75 @@
             });
         }
         
-        // Fetch requests periodically
-        function fetchRequests() {
+        // Load initial requests
+        function loadRequests() {
             fetch('/api/requests')
                 .then(response => response.json())
                 .then(data => {
                     const requestList = document.getElementById('requestList');
                     requestList.innerHTML = '';
-                    
-                    data.forEach((req, index) => {
-                        const item = document.createElement('div');
-                        item.className = 'request-item';
-                        item.innerHTML = `<strong>${req.method}</strong> ${req.url.substring(0, 30)}${req.url.length > 30 ? '...' : ''} <br><small>${req.timestamp}</small>`;
-                        item.onclick = () => showRequestDetails(req.id);
-                        requestList.appendChild(item);
-                    });
+                    data.forEach(req => addRequestToList(req));
                 });
         }
         
-        // Fetch blocked domains
-        function fetchBlockedDomains() {
+        function addRequestToList(req) {
+    const requestList = document.getElementById('requestList');
+    const item = document.createElement('div');
+    item.className = 'request-item fade-in';
+    
+    const methodSpan = document.createElement('span');
+    methodSpan.className = `request-method method-${req.method}`;
+    methodSpan.textContent = req.method;
+    
+    const urlSpan = document.createElement('span');
+    urlSpan.className = 'request-url';
+    urlSpan.textContent = req.url.substring(0, 30) + (req.url.length > 30 ? '...' : '');
+    
+    const timeSpan = document.createElement('span');
+    timeSpan.className = 'request-time';
+    timeSpan.textContent = req.timestamp.split(' ')[1]; // Just show time
+    
+    item.appendChild(methodSpan);
+    item.appendChild(urlSpan);
+    item.appendChild(timeSpan);
+    item.onclick = () => showRequestDetails(req.id);
+    
+    // Add to top of list
+    if (requestList.firstChild) {
+        requestList.insertBefore(item, requestList.firstChild);
+    } else {
+        requestList.appendChild(item);
+    }
+    
+    // Limit items
+    while (requestList.children.length > 100) {
+        requestList.removeChild(requestList.lastChild);
+    }
+}
+        
+        // Load blocked domains
+        function loadBlockedDomains() {
             fetch('/api/blocked-domains')
                 .then(response => response.json())
-                .then(data => {
-                    const list = document.getElementById('blockedDomainsList');
-                    list.innerHTML = '';
-                    
-                    data.forEach(domain => {
-                        const item = document.createElement('li');
-                        item.textContent = domain;
-                        const removeBtn = document.createElement('button');
-                        removeBtn.textContent = 'Remove';
-                        removeBtn.onclick = () => unblockDomain(domain);
-                        item.appendChild(removeBtn);
-                        list.appendChild(item);
-                    });
-                });
+                .then(data => updateBlockedDomains(data));
+        }
+        
+        function updateBlockedDomains(domains) {
+            const list = document.getElementById('blockedDomainsList');
+            list.innerHTML = '';
+            
+            domains.forEach(domain => {
+                const item = document.createElement('li');
+                item.textContent = domain;
+                const removeBtn = document.createElement('button');
+                removeBtn.textContent = 'X';
+                removeBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    unblockDomain(domain);
+                };
+                item.appendChild(removeBtn);
+                list.appendChild(item);
+            });
         }
         
         // Show request details
@@ -167,26 +186,18 @@
                     const detailsDiv = document.getElementById('requestDetails');
                     detailsDiv.innerHTML = `
                         <h3>${req.method} ${req.url}</h3>
-                        <p><strong>Timestamp:</strong> ${req.timestamp}</p>
+                        <p>${req.timestamp}</p>
                         <h4>Headers:</h4>
                         <pre>${JSON.stringify(req.headers, null, 2)}</pre>
                         <h4>Body:</h4>
-                        <pre>${JSON.stringify(req.body, null, 2)}</pre>
+                        <pre>${req.body || "(empty)"}</pre>
                         <h4>Response:</h4>
                         <pre>${JSON.stringify(req.response, null, 2)}</pre>
                     `;
                     
-                    // Select the item in the list
                     document.querySelectorAll('.request-item').forEach(item => {
                         item.classList.remove('selected');
                     });
-                    const items = document.querySelectorAll('.request-item');
-                    for (let i = 0; i < items.length; i++) {
-                        if (items[i].onclick.toString().includes(req.id)) {
-                            items[i].classList.add('selected');
-                            break;
-                        }
-                    }
                 });
         }
         
@@ -201,7 +212,7 @@
                     body: JSON.stringify({domain})
                 }).then(() => {
                     document.getElementById('domainInput').value = '';
-                    fetchBlockedDomains();
+                    loadBlockedDomains();
                 });
             }
         });
@@ -212,9 +223,7 @@
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({domain})
-            }).then(() => {
-                fetchBlockedDomains();
-            });
+            }).then(() => loadBlockedDomains());
         }
         
         // Forge request
@@ -227,14 +236,10 @@
             
             try {
                 const headersText = document.getElementById('headers').value;
-                if (headersText) {
-                    headers = JSON.parse(headersText);
-                }
+                if (headersText) headers = JSON.parse(headersText);
                 
                 const bodyText = document.getElementById('body').value;
-                if (bodyText) {
-                    body = bodyText;
-                }
+                if (bodyText) body = bodyText;
                 
                 fetch('/api/forge-request', {
                     method: 'POST',
@@ -247,30 +252,19 @@
                         <h3>Response:</h3>
                         <pre>${JSON.stringify(data, null, 2)}</pre>
                     `;
-                    fetchRequests();
-                })
-                .catch(error => {
-                    document.getElementById('forgeResponse').innerHTML = `
-                        <h3>Error:</h3>
-                        <pre>${error}</pre>
-                    `;
                 });
             } catch (error) {
                 document.getElementById('forgeResponse').innerHTML = `
                     <h3>Error:</h3>
-                    <pre>Invalid JSON format: ${error.message}</pre>
+                    <pre>Invalid JSON: ${error.message}</pre>
                 `;
             }
         });
         
-        // Initial data load
+        // Initial load
         fetchProxyStatus();
-        fetchRequests();
-        fetchBlockedDomains();
-        
-        // Refresh data every 2 seconds
-        setInterval(fetchRequests, 2000);
-        setInterval(fetchProxyStatus, 5000);
+        loadRequests();
+        loadBlockedDomains();
     </script>
 </body>
 </html>
