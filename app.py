@@ -1,692 +1,621 @@
-from flask import Flask, render_template, request, jsonify
-import requests
-import threading
+"""
+Interceptor — a lightweight HTTP/HTTPS interception proxy with a web UI.
+
+Captures traffic through a local proxy, lets you inspect requests/responses,
+block domains, replay/edit-and-resend captured requests (Repeater), and forge
+brand-new requests from scratch. Built for learning proxy/MITM mechanics and
+for quick manual testing during CTFs and lab work.
+
+Run:
+    pip install -r requirements.txt
+    python app.py
+Then point a client/browser at the proxy port shown in the banner, or use the
+web UI's Repeater/Forge tools directly without configuring a proxy at all.
+"""
 import json
-from urllib.parse import urlparse
 import logging
-from datetime import datetime
 import os
 import socket
+import sqlite3
+import threading
+import time
 from collections import deque
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse
 
-app = Flask(__name__, static_folder='static')
+import requests
+from flask import Flask, jsonify, render_template, request
+from flask_sock import Sock
 
-# Use deque with max length to limit memory usage
-intercepted_requests = deque(maxlen=100)
-blocked_domains = set()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("interceptor")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "interceptor.db")
+MAX_HISTORY = 500          # in-memory ring buffer size
+MAX_BODY_PREVIEW = 20000   # chars stored per body, to keep the DB/UI sane
+
+app = Flask(__name__)
+sock = Sock(app)
+
+# ---------------------------------------------------------------------------
+# Shared state (thread-safe)
+# ---------------------------------------------------------------------------
+state_lock = threading.RLock()
+intercepted_requests = deque(maxlen=MAX_HISTORY)
 request_counter = 0
+blocked_domains = set()
+ws_clients = set()
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-# Create templates directory
-os.makedirs('templates', exist_ok=True)
+def next_id():
+    global request_counter
+    with state_lock:
+        request_counter += 1
+        return request_counter
 
-# Find available port
-def find_available_port(start_port, max_attempts=10):
+
+def now_iso():
+    return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def truncate(text, limit=MAX_BODY_PREVIEW):
+    if text is None:
+        return ""
+    if len(text) > limit:
+        return text[:limit] + f"\n... [truncated, {len(text) - limit} more chars]"
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Persistence (SQLite) — history and blocked domains survive restarts
+# ---------------------------------------------------------------------------
+def db_connect():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = db_connect()
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS requests (
+            id INTEGER PRIMARY KEY,
+            method TEXT, url TEXT, host TEXT, headers TEXT, body TEXT,
+            timestamp TEXT, source TEXT, status_code INTEGER, response TEXT,
+            note TEXT DEFAULT ''
+        )"""
+    )
+    conn.execute("CREATE TABLE IF NOT EXISTS blocked_domains (domain TEXT PRIMARY KEY)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_host ON requests(host)")
+    conn.commit()
+
+    # Warm the in-memory ring buffer with the most recent rows
+    rows = conn.execute(
+        "SELECT * FROM requests ORDER BY id DESC LIMIT ?", (MAX_HISTORY,)
+    ).fetchall()
+    global request_counter
+    for row in rows:
+        d = dict(row)
+        d["response"] = json.loads(d["response"]) if d["response"] else None
+        d["headers"] = json.loads(d["headers"]) if d["headers"] else {}
+        intercepted_requests.append(d)
+        request_counter = max(request_counter, d["id"])
+    for row in conn.execute("SELECT domain FROM blocked_domains"):
+        blocked_domains.add(row["domain"])
+    conn.close()
+    logger.info("Loaded %d requests, %d blocked domains from %s",
+                len(intercepted_requests), len(blocked_domains), DB_PATH)
+
+
+def persist_request(req):
+    conn = db_connect()
+    conn.execute(
+        """INSERT OR REPLACE INTO requests
+           (id, method, url, host, headers, body, timestamp, source, status_code, response, note)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            req["id"], req["method"], req["url"], req.get("host", ""),
+            json.dumps(req.get("headers", {})), req.get("body", ""),
+            req["timestamp"], req["source"],
+            (req.get("response") or {}).get("status_code"),
+            json.dumps(req.get("response")) if req.get("response") is not None else None,
+            req.get("note", ""),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def persist_blocked_domains():
+    conn = db_connect()
+    conn.execute("DELETE FROM blocked_domains")
+    conn.executemany(
+        "INSERT INTO blocked_domains (domain) VALUES (?)",
+        [(d,) for d in blocked_domains],
+    )
+    conn.commit()
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# WebSocket broadcast — pushes live updates to every connected UI tab
+# ---------------------------------------------------------------------------
+def broadcast(payload):
+    dead = []
+    data = json.dumps(payload)
+    for client in list(ws_clients):
+        try:
+            client.send(data)
+        except Exception:
+            dead.append(client)
+    for client in dead:
+        ws_clients.discard(client)
+
+
+def record_request(req):
+    """Append to history, persist, and notify all connected UIs."""
+    with state_lock:
+        intercepted_requests.appendleft(req)
+    persist_request(req)
+    broadcast({"type": "request", "request": req})
+
+
+def is_blocked(host_or_domain):
+    if not host_or_domain:
+        return False
+    host_or_domain = host_or_domain.split(":")[0].lower()
+    with state_lock:
+        return any(
+            host_or_domain == d or host_or_domain.endswith("." + d)
+            for d in blocked_domains
+        )
+
+
+def find_available_port(start_port, host="127.0.0.1", max_attempts=20):
     for port in range(start_port, start_port + max_attempts):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            if s.connect_ex(('localhost', port)) != 0:
+            s.settimeout(0.2)
+            if s.connect_ex((host, port)) != 0:
                 return port
     return None
 
-# Create simplified HTML template
-with open('templates/index.html', 'w') as f:
-    f.write('''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Web Request Inspector</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; }
-        .container { display: flex; }
-        .sidebar { width: 300px; padding-right: 20px; }
-        .main { flex-grow: 1; }
-        .request-list { height: 500px; overflow-y: auto; border: 1px solid #ccc; }
-        .request-item { padding: 10px; border-bottom: 1px solid #eee; cursor: pointer; }
-        .request-item:hover { background-color: #f5f5f5; }
-        .selected { background-color: #e0e0e0; }
-        .request-details { margin-top: 20px; border: 1px solid #ccc; padding: 10px; }
-        .blocked-domains { margin-top: 20px; }
-        .forge-form { margin-top: 20px; border: 1px solid #ccc; padding: 10px; }
-        textarea { width: 100%; height: 100px; }
-        .status { background-color: #f0f0f0; padding: 10px; margin: 10px 0; border-radius: 5px; }
-    </style>
-</head>
-<body>
-    <h1>Web Request Inspector</h1>
-    <div class="status" id="proxyStatus">Proxy server status: Loading...</div>
-    
-    <div class="container">
-        <div class="sidebar">
-            <h2>Requests</h2>
-            <div class="request-list" id="requestList"></div>
-            
-            <div class="blocked-domains">
-                <h2>Blocked Domains</h2>
-                <form id="blockForm">
-                    <input type="text" id="domainInput" placeholder="example.com">
-                    <button type="submit">Block</button>
-                </form>
-                <ul id="blockedDomainsList"></ul>
-            </div>
-        </div>
-        
-        <div class="main">
-            <div class="request-details" id="requestDetails">
-                <p>Select a request to view details</p>
-            </div>
-            
-            <div class="forge-form">
-                <h2>Forge Request</h2>
-                <form id="forgeForm">
-                    <select id="method">
-                        <option value="GET">GET</option>
-                        <option value="POST">POST</option>
-                        <option value="PUT">PUT</option>
-                        <option value="DELETE">DELETE</option>
-                    </select>
-                    <input type="text" id="url" style="width: 100%;" placeholder="http://example.com/api">
-                    <textarea id="headers" placeholder='{"Content-Type": "application/json"}'></textarea>
-                    <textarea id="body" placeholder='{"key": "value"}'></textarea>
-                    <button type="submit">Send</button>
-                </form>
-                <div id="forgeResponse"></div>
-            </div>
-        </div>
-    </div>
-    
-    <script>
-        // Setup WebSocket for real-time updates
-        const ws = new WebSocket(`ws://${window.location.host}/ws`);
-        ws.onmessage = function(event) {
-            const data = JSON.parse(event.data);
-            if (data.type === 'request') {
-                addRequestToList(data.request);
-            } else if (data.type === 'blocked_domains') {
-                updateBlockedDomains(data.domains);
-            } else if (data.type === 'proxy_status') {
-                updateProxyStatus(data.status);
-            }
-        };
-        
-        // Fetch proxy status
-        function fetchProxyStatus() {
-            fetch('/api/proxy-status')
-                .then(response => response.json())
-                .then(data => updateProxyStatus(data));
-        }
-        
-        function updateProxyStatus(status) {
-            const statusDiv = document.getElementById('proxyStatus');
-            statusDiv.innerHTML = `Proxy server status: ${status.running ? 'Running' : 'Stopped'} 
-                                  ${status.running ? `on ${status.host}:${status.port}` : ''}
-                                  <button id="toggleProxy">${status.running ? 'Stop' : 'Start'}</button>`;
-            
-            document.getElementById('toggleProxy').onclick = () => toggleProxy(status.running);
-        }
-        
-        // Toggle proxy
-        function toggleProxy(isRunning) {
-            fetch('/api/toggle-proxy', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({action: isRunning ? 'stop' : 'start'})
-            })
-            .then(response => response.json())
-            .then(data => {
-                fetchProxyStatus();
-                alert(data.message);
-            });
-        }
-        
-        // Load initial requests
-        function loadRequests() {
-            fetch('/api/requests')
-                .then(response => response.json())
-                .then(data => {
-                    const requestList = document.getElementById('requestList');
-                    requestList.innerHTML = '';
-                    data.forEach(req => addRequestToList(req));
-                });
-        }
-        
-        function addRequestToList(req) {
-    const requestList = document.getElementById('requestList');
-    const item = document.createElement('div');
-    item.className = 'request-item fade-in';
-    
-    const methodSpan = document.createElement('span');
-    methodSpan.className = `request-method method-${req.method}`;
-    methodSpan.textContent = req.method;
-    
-    const urlSpan = document.createElement('span');
-    urlSpan.className = 'request-url';
-    urlSpan.textContent = req.url.substring(0, 30) + (req.url.length > 30 ? '...' : '');
-    
-    const timeSpan = document.createElement('span');
-    timeSpan.className = 'request-time';
-    timeSpan.textContent = req.timestamp.split(' ')[1]; // Just show time
-    
-    item.appendChild(methodSpan);
-    item.appendChild(urlSpan);
-    item.appendChild(timeSpan);
-    item.onclick = () => showRequestDetails(req.id);
-    
-    // Add to top of list
-    if (requestList.firstChild) {
-        requestList.insertBefore(item, requestList.firstChild);
-    } else {
-        requestList.appendChild(item);
-    }
-    
-    // Limit items
-    while (requestList.children.length > 100) {
-        requestList.removeChild(requestList.lastChild);
-    }
-}
-        
-        // Load blocked domains
-        function loadBlockedDomains() {
-            fetch('/api/blocked-domains')
-                .then(response => response.json())
-                .then(data => updateBlockedDomains(data));
-        }
-        
-        function updateBlockedDomains(domains) {
-            const list = document.getElementById('blockedDomainsList');
-            list.innerHTML = '';
-            
-            domains.forEach(domain => {
-                const item = document.createElement('li');
-                item.textContent = domain;
-                const removeBtn = document.createElement('button');
-                removeBtn.textContent = 'X';
-                removeBtn.onclick = (e) => {
-                    e.stopPropagation();
-                    unblockDomain(domain);
-                };
-                item.appendChild(removeBtn);
-                list.appendChild(item);
-            });
-        }
-        
-        // Show request details
-        function showRequestDetails(id) {
-            fetch(`/api/request/${id}`)
-                .then(response => response.json())
-                .then(req => {
-                    const detailsDiv = document.getElementById('requestDetails');
-                    detailsDiv.innerHTML = `
-                        <h3>${req.method} ${req.url}</h3>
-                        <p>${req.timestamp}</p>
-                        <h4>Headers:</h4>
-                        <pre>${JSON.stringify(req.headers, null, 2)}</pre>
-                        <h4>Body:</h4>
-                        <pre>${req.body || "(empty)"}</pre>
-                        <h4>Response:</h4>
-                        <pre>${JSON.stringify(req.response, null, 2)}</pre>
-                    `;
-                    
-                    document.querySelectorAll('.request-item').forEach(item => {
-                        item.classList.remove('selected');
-                    });
-                });
-        }
-        
-        // Block domain
-        document.getElementById('blockForm').addEventListener('submit', function(e) {
-            e.preventDefault();
-            const domain = document.getElementById('domainInput').value.trim();
-            if (domain) {
-                fetch('/api/block-domain', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({domain})
-                }).then(() => {
-                    document.getElementById('domainInput').value = '';
-                    loadBlockedDomains();
-                });
-            }
-        });
-        
-        // Unblock domain
-        function unblockDomain(domain) {
-            fetch('/api/unblock-domain', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({domain})
-            }).then(() => loadBlockedDomains());
-        }
-        
-        // Forge request
-        document.getElementById('forgeForm').addEventListener('submit', function(e) {
-            e.preventDefault();
-            const method = document.getElementById('method').value;
-            const url = document.getElementById('url').value;
-            let headers = {};
-            let body = '';
-            
-            try {
-                const headersText = document.getElementById('headers').value;
-                if (headersText) headers = JSON.parse(headersText);
-                
-                const bodyText = document.getElementById('body').value;
-                if (bodyText) body = bodyText;
-                
-                fetch('/api/forge-request', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({method, url, headers, body})
-                })
-                .then(response => response.json())
-                .then(data => {
-                    document.getElementById('forgeResponse').innerHTML = `
-                        <h3>Response:</h3>
-                        <pre>${JSON.stringify(data, null, 2)}</pre>
-                    `;
-                });
-            } catch (error) {
-                document.getElementById('forgeResponse').innerHTML = `
-                    <h3>Error:</h3>
-                    <pre>Invalid JSON: ${error.message}</pre>
-                `;
-            }
-        });
-        
-        // Initial load
-        fetchProxyStatus();
-        loadRequests();
-        loadBlockedDomains();
-    </script>
-</body>
-</html>
-    ''')
 
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-# WebSocket for real-time updates
-from flask_sock import Sock
-sock = Sock(app)
-ws_clients = set()
-
-@sock.route('/ws')
-def websocket(ws):
-    ws_clients.add(ws)
-    try:
-        while True:
-            message = ws.receive()
-            # Just keep connection alive
-    except:
-        pass
-    finally:
-        ws_clients.remove(ws)
-
-def broadcast_update(data):
-    for client in list(ws_clients):
-        try:
-            client.send(json.dumps(data))
-        except:
-            ws_clients.remove(client)
-
-# API routes
-@app.route('/api/requests')
-def get_requests():
-    return jsonify(list(intercepted_requests))
-
-@app.route('/api/request/<int:request_id>')
-def get_request(request_id):
-    for req in intercepted_requests:
-        if req['id'] == request_id:
-            return jsonify(req)
-    return jsonify({"error": "Request not found"}), 404
-
-@app.route('/api/blocked-domains')
-def get_blocked_domains():
-    return jsonify(list(blocked_domains))
-
-@app.route('/api/block-domain', methods=['POST'])
-def block_domain():
-    data = request.json
-    domain = data.get('domain', '').strip()
-    if domain:
-        blocked_domains.add(domain)
-        broadcast_update({"type": "blocked_domains", "domains": list(blocked_domains)})
-    return jsonify({"success": True})
-
-@app.route('/api/unblock-domain', methods=['POST'])
-def unblock_domain():
-    data = request.json
-    domain = data.get('domain', '')
-    if domain in blocked_domains:
-        blocked_domains.remove(domain)
-        broadcast_update({"type": "blocked_domains", "domains": list(blocked_domains)})
-    return jsonify({"success": True})
-
-@app.route('/api/forge-request', methods=['POST'])
-def forge_request():
-    global request_counter
-    
-    data = request.json
-    method = data.get('method', 'GET')
-    url = data.get('url', '')
-    headers = data.get('headers', {})
-    body = data.get('body', '')
-    
-    if not url:
-        return jsonify({"error": "URL is required"}), 400
-    
-    # Process request
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    req_data = {
-        "id": request_counter,
-        "method": method,
-        "url": url,
-        "headers": headers,
-        "body": body,
-        "timestamp": timestamp,
-        "source": "Forged",
-        "response": None
-    }
-    
-    # Check if domain is blocked
-    parsed_url = urlparse(url)
-    domain = parsed_url.netloc
-    if domain in blocked_domains:
-        req_data["response"] = {"error": f"Domain {domain} is blocked"}
-        intercepted_requests.appendleft(req_data)
-        request_counter += 1
-        broadcast_update({"type": "request", "request": req_data})
-        return jsonify({"error": f"Domain {domain} is blocked"}), 403
-    
-    # Make request
-    try:
-        response = requests.request(
-            method=method,
-            url=url,
-            headers=headers,
-            data=body,
-            timeout=10
-        )
-        
-        # Store response
-        try:
-            response_json = response.json()
-        except:
-            response_json = {"text": response.text[:1000]}
-        
-        req_data["response"] = {
-            "status_code": response.status_code,
-            "headers": dict(response.headers),
-            "body": response_json
-        }
-        
-    except Exception as e:
-        req_data["response"] = {"error": str(e)}
-    
-    intercepted_requests.appendleft(req_data)
-    request_counter += 1
-    broadcast_update({"type": "request", "request": req_data})
-    
-    return jsonify(req_data["response"])
-
-# Proxy server class
+# ---------------------------------------------------------------------------
+# Proxy server — the actual man-in-the-middle for plain HTTP, plus HTTPS
+# tunneling (CONNECT). TLS payloads are relayed opaquely (not decrypted) —
+# that keeps the tool honest about what it can see without a client-side
+# trusted CA, while HTTP traffic is fully captured and inspectable.
+# ---------------------------------------------------------------------------
 class ProxyServer:
-    def __init__(self, host='127.0.0.1', port=None):
+    def __init__(self, host="127.0.0.1", port=None):
         self.host = host
-        self.port = port if port else find_available_port(8080)
+        self.port = port
         self.server = None
         self.thread = None
         self.running = False
-    
+
+    def status(self):
+        return {"running": self.running, "host": self.host, "port": self.port}
+
     def start(self):
         if self.running:
-            return {"success": False, "message": "Proxy already running"}
-        
+            return {"success": False, "message": "Proxy is already running"}
+
+        self.port = self.port or find_available_port(8080)
         if not self.port:
-            return {"success": False, "message": "No available ports found"}
-        
-        from http.server import HTTPServer, BaseHTTPRequestHandler
-        
+            return {"success": False, "message": "No available port found for the proxy"}
+
+        proxy = self
+
         class ProxyHandler(BaseHTTPRequestHandler):
-            timeout = 10
-            
+            protocol_version = "HTTP/1.1"
+            timeout = 15
+
+            def log_message(self, fmt, *args):
+                pass  # silence default stderr access log; we log via the app logger
+
+            def handle_one_request(self):
+                # Clients (browsers especially) routinely close idle keep-alive
+                # sockets without warning; the stdlib handler treats that as an
+                # unhandled exception. Swallow the noise, keep real errors.
+                try:
+                    super().handle_one_request()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    self.close_connection = True
+
             def do_GET(self):
-                self._handle_request('GET')
-            
+                self._forward("GET")
+
             def do_POST(self):
-                self._handle_request('POST')
-            
+                self._forward("POST")
+
             def do_PUT(self):
-                self._handle_request('PUT')
-            
+                self._forward("PUT")
+
             def do_DELETE(self):
-                self._handle_request('DELETE')
-            
+                self._forward("DELETE")
+
+            def do_PATCH(self):
+                self._forward("PATCH")
+
+            def do_HEAD(self):
+                self._forward("HEAD")
+
+            def do_OPTIONS(self):
+                self._forward("OPTIONS")
+
             def do_CONNECT(self):
-                global request_counter, intercepted_requests
-                
-                host_port = self.path.split(':')
-                host = host_port[0]
-                port = int(host_port[1]) if len(host_port) > 1 else 443
-                
-                req_data = {
-                    "id": request_counter,
+                host, _, port_s = self.path.partition(":")
+                port = int(port_s) if port_s else 443
+
+                req = {
+                    "id": next_id(),
                     "method": "CONNECT",
                     "url": f"https://{host}:{port}",
+                    "host": host,
                     "headers": dict(self.headers),
                     "body": "",
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "source": "Intercepted",
-                    "response": {"info": "HTTPS connection tunneled"}
+                    "timestamp": now_iso(),
+                    "source": "proxy",
+                    "response": {"info": "TLS tunnel opened (payload not decrypted)"},
                 }
-                
-                # Check if domain is blocked
-                if host in blocked_domains:
-                    self.send_error(403, f"Domain {host} is blocked")
-                    req_data["response"] = {"error": f"Domain {host} is blocked"}
-                    intercepted_requests.appendleft(req_data)
-                    request_counter += 1
-                    broadcast_update({"type": "request", "request": req_data})
+
+                if is_blocked(host):
+                    self.send_error(403, f"Domain '{host}' is blocked")
+                    req["response"] = {"error": f"domain '{host}' is blocked"}
+                    record_request(req)
                     return
-                
+
                 try:
-                    # Connect to remote server
-                    remote_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    remote_socket.connect((host, port))
-                    
-                    # Send success response
-                    self.send_response(200, 'Connection Established')
+                    remote = socket.create_connection((host, port), timeout=10)
+                    self.send_response(200, "Connection Established")
                     self.end_headers()
-                    
-                    # Log connection
-                    intercepted_requests.appendleft(req_data)
-                    request_counter += 1
-                    broadcast_update({"type": "request", "request": req_data})
-                    
-                    # Set up tunneling
-                    socket_tunnel(self.connection, remote_socket)
-                    
-                except Exception as e:
-                    self.send_error(500, str(e))
-                    req_data["response"] = {"error": str(e)}
-                    intercepted_requests.appendleft(req_data)
-                    request_counter += 1
-                    broadcast_update({"type": "request", "request": req_data})
-            
-            def _handle_request(self, method):
-                global request_counter, intercepted_requests
-                
+                    record_request(req)
+                    self._tunnel(self.connection, remote)
+                except Exception as exc:
+                    self.send_error(502, str(exc))
+                    req["response"] = {"error": str(exc)}
+                    record_request(req)
+
+            def _tunnel(self, client_sock, remote_sock):
+                def pump(src, dst):
+                    try:
+                        while True:
+                            chunk = src.recv(8192)
+                            if not chunk:
+                                break
+                            dst.sendall(chunk)
+                    except OSError:
+                        pass
+                    finally:
+                        for s in (src, dst):
+                            try:
+                                s.shutdown(socket.SHUT_RDWR)
+                            except OSError:
+                                pass
+
+                threading.Thread(target=pump, args=(client_sock, remote_sock), daemon=True).start()
+                threading.Thread(target=pump, args=(remote_sock, client_sock), daemon=True).start()
+
+            def _forward(self, method):
                 url = self.path
-                if not url.startswith('http'):
-                    url = 'http://' + self.headers.get('Host', '') + url
-                
-                # Parse headers
-                headers = {k: v for k, v in self.headers.items()}
-                
-                # Get body
-                content_length = int(self.headers.get('Content-Length', 0))
-                body = self.rfile.read(content_length).decode('utf-8') if content_length > 0 else ''
-                
-                # Create request data
-                req_data = {
-                    "id": request_counter,
+                host_header = self.headers.get("Host", "")
+                if not url.startswith("http"):
+                    url = f"http://{host_header}{url}"
+
+                headers = {k: v for k, v in self.headers.items() if k.lower() != "proxy-connection"}
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                body = self.rfile.read(length).decode("utf-8", errors="replace") if length else ""
+
+                domain = urlparse(url).netloc
+                req = {
+                    "id": next_id(),
                     "method": method,
                     "url": url,
+                    "host": domain,
                     "headers": headers,
-                    "body": body,
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "source": "Intercepted",
-                    "response": None
+                    "body": truncate(body),
+                    "timestamp": now_iso(),
+                    "source": "proxy",
+                    "response": None,
                 }
-                
-                # Check if domain is blocked
-                parsed_url = urlparse(url)
-                domain = parsed_url.netloc
-                if domain in blocked_domains:
+
+                if is_blocked(domain):
                     self.send_response(403)
-                    self.send_header('Content-type', 'text/html')
+                    self.send_header("Content-Type", "text/plain")
                     self.end_headers()
-                    self.wfile.write(f"Domain {domain} is blocked".encode())
-                    
-                    req_data["response"] = {"error": f"Domain {domain} is blocked"}
-                    intercepted_requests.appendleft(req_data)
-                    request_counter += 1
-                    broadcast_update({"type": "request", "request": req_data})
+                    self.wfile.write(f"Blocked by Interceptor: {domain}".encode())
+                    req["response"] = {"error": f"domain '{domain}' is blocked"}
+                    record_request(req)
                     return
-                
-                # Forward request
+
                 try:
-                    response = requests.request(
-                        method=method,
-                        url=url,
-                        headers=headers,
-                        data=body,
-                        timeout=10,
-                        allow_redirects=False
+                    upstream = requests.request(
+                        method=method, url=url, headers=headers,
+                        data=body.encode("utf-8") if body else None,
+                        timeout=15, allow_redirects=False, stream=True,
                     )
-                    
-                    # Send response to client
-                    self.send_response(response.status_code)
-                    for header, value in response.headers.items():
-                        if header.lower() not in ('transfer-encoding', 'connection'):
-                            self.send_header(header, value)
+                    self.send_response(upstream.status_code)
+                    skip = {"transfer-encoding", "connection", "content-encoding"}
+                    for h, v in upstream.headers.items():
+                        if h.lower() not in skip:
+                            self.send_header(h, v)
+                    content = upstream.content
+                    self.send_header("Content-Length", str(len(content)))
                     self.end_headers()
-                    
-                    if method != 'HEAD':
-                        self.wfile.write(response.content)
-                    
-                    # Store response
-                    try:
-                        response_json = response.json()
-                    except:
-                        response_text = response.text[:500]
-                        response_json = {"text": response_text}
-                    
-                    req_data["response"] = {
-                        "status_code": response.status_code,
-                        "headers": dict(response.headers),
-                        "body": response_json
+                    if method != "HEAD":
+                        self.wfile.write(content)
+
+                    body_preview = upstream.text[:MAX_BODY_PREVIEW]
+                    req["response"] = {
+                        "status_code": upstream.status_code,
+                        "headers": dict(upstream.headers),
+                        "body": body_preview,
                     }
-                    
-                except Exception as e:
-                    self.send_response(500)
-                    self.send_header('Content-type', 'text/html')
-                    self.end_headers()
-                    self.wfile.write(f"Error: {str(e)}".encode())
-                    
-                    req_data["response"] = {"error": str(e)}
-                
-                intercepted_requests.appendleft(req_data)
-                request_counter += 1
-                broadcast_update({"type": "request", "request": req_data})
-        
-        # Create HTTPS tunnel
-        def socket_tunnel(client, remote):
-            client_to_remote = threading.Thread(
-                target=forward_socket_data, 
-                args=(client, remote),
-                daemon=True
-            )
-            remote_to_client = threading.Thread(
-                target=forward_socket_data, 
-                args=(remote, client),
-                daemon=True
-            )
-            
-            client_to_remote.start()
-            remote_to_client.start()
-        
-        def forward_socket_data(source, destination):
-            try:
-                while True:
-                    data = source.recv(4096)
-                    if not data:
-                        break
-                    destination.sendall(data)
-            except:
-                pass
-        
+                except Exception as exc:
+                    try:
+                        self.send_response(502)
+                        self.send_header("Content-Type", "text/plain")
+                        self.end_headers()
+                        self.wfile.write(f"Interceptor error: {exc}".encode())
+                    except Exception:
+                        pass
+                    req["response"] = {"error": str(exc)}
+
+                record_request(req)
+
         try:
-            # Create server with address reuse
-            class ReuseAddressHTTPServer(HTTPServer):
-                allow_reuse_address = True
-            
-            self.server = ReuseAddressHTTPServer((self.host, self.port), ProxyHandler)
+            self.server = HTTPServer((self.host, self.port), ProxyHandler)
+            self.server.allow_reuse_address = True
             self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
             self.thread.start()
             self.running = True
-            
-            # Broadcast status update
-            status = {"running": True, "host": self.host, "port": self.port}
-            broadcast_update({"type": "proxy_status", "status": status})
-            
+            broadcast({"type": "proxy_status", "status": self.status()})
+            logger.info("Proxy listening on %s:%s", self.host, self.port)
             return {"success": True, "message": f"Proxy started on {self.host}:{self.port}"}
-        except Exception as e:
-            return {"success": False, "message": f"Error starting proxy: {str(e)}"}
-    
-    def stop(self):
-        if self.server and self.running:
-            self.server.shutdown()
-            self.running = False
-            
-            # Broadcast status update
-            status = {"running": False, "host": self.host, "port": self.port}
-            broadcast_update({"type": "proxy_status", "status": status})
-            
-            return {"success": True, "message": "Proxy server stopped"}
-        return {"success": False, "message": "Proxy server not running"}
+        except OSError as exc:
+            return {"success": False, "message": f"Could not start proxy: {exc}"}
 
-# Create proxy instance
+    def stop(self):
+        if not self.running:
+            return {"success": False, "message": "Proxy is not running"}
+        self.server.shutdown()
+        self.server.server_close()
+        self.running = False
+        broadcast({"type": "proxy_status", "status": self.status()})
+        return {"success": True, "message": "Proxy stopped"}
+
+
 proxy = ProxyServer()
 
-@app.route('/api/proxy-status')
-def proxy_status():
-    return jsonify({
-        "running": proxy.running,
-        "host": proxy.host,
-        "port": proxy.port
-    })
 
-@app.route('/api/toggle-proxy', methods=['POST'])
-def toggle_proxy():
-    data = request.json
-    action = data.get('action')
-    
-    if action == 'start':
-        result = proxy.start()
-        return jsonify(result)
-    elif action == 'stop':
-        result = proxy.stop()
-        return jsonify(result)
-    else:
-        return jsonify({"success": False, "message": "Invalid action"})
+# ---------------------------------------------------------------------------
+# Web UI + JSON API
+# ---------------------------------------------------------------------------
+@app.route("/")
+def index():
+    return render_template("index.html")
 
-if __name__ == '__main__':
+
+@sock.route("/ws")
+def ws_endpoint(ws):
+    ws_clients.add(ws)
+    try:
+        while True:
+            ws.receive()  # block until client disconnects; we only push
+    except Exception:
+        pass
+    finally:
+        ws_clients.discard(ws)
+
+
+@app.get("/api/proxy-status")
+def api_proxy_status():
+    return jsonify(proxy.status())
+
+
+@app.post("/api/toggle-proxy")
+def api_toggle_proxy():
+    action = (request.json or {}).get("action")
+    if action == "start":
+        return jsonify(proxy.start())
+    if action == "stop":
+        return jsonify(proxy.stop())
+    return jsonify({"success": False, "message": "action must be 'start' or 'stop'"}), 400
+
+
+@app.get("/api/requests")
+def api_list_requests():
+    """Supports ?method=GET&q=api&limit=100 for lightweight client-side-free filtering."""
+    method = request.args.get("method", "").upper()
+    q = request.args.get("q", "").lower()
+    limit = min(int(request.args.get("limit", 200)), MAX_HISTORY)
+
+    with state_lock:
+        items = list(intercepted_requests)
+
+    if method:
+        items = [r for r in items if r["method"] == method]
+    if q:
+        items = [r for r in items if q in r["url"].lower() or q in (r.get("host") or "").lower()]
+
+    return jsonify(items[:limit])
+
+
+@app.get("/api/request/<int:req_id>")
+def api_get_request(req_id):
+    with state_lock:
+        for r in intercepted_requests:
+            if r["id"] == req_id:
+                return jsonify(r)
+    return jsonify({"error": "not found"}), 404
+
+
+@app.post("/api/request/<int:req_id>/note")
+def api_set_note(req_id):
+    note = (request.json or {}).get("note", "")
+    with state_lock:
+        for r in intercepted_requests:
+            if r["id"] == req_id:
+                r["note"] = note
+                persist_request(r)
+                return jsonify({"success": True})
+    return jsonify({"error": "not found"}), 404
+
+
+@app.delete("/api/requests")
+def api_clear_requests():
+    with state_lock:
+        intercepted_requests.clear()
+    conn = db_connect()
+    conn.execute("DELETE FROM requests")
+    conn.commit()
+    conn.close()
+    broadcast({"type": "cleared"})
+    return jsonify({"success": True})
+
+
+@app.get("/api/blocked-domains")
+def api_get_blocked():
+    with state_lock:
+        return jsonify(sorted(blocked_domains))
+
+
+@app.post("/api/block-domain")
+def api_block_domain():
+    domain = (request.json or {}).get("domain", "").strip().lower()
+    if not domain:
+        return jsonify({"success": False, "message": "domain required"}), 400
+    with state_lock:
+        blocked_domains.add(domain)
+        persist_blocked_domains()
+    broadcast({"type": "blocked_domains", "domains": sorted(blocked_domains)})
+    return jsonify({"success": True})
+
+
+@app.post("/api/unblock-domain")
+def api_unblock_domain():
+    domain = (request.json or {}).get("domain", "")
+    with state_lock:
+        blocked_domains.discard(domain)
+        persist_blocked_domains()
+    broadcast({"type": "blocked_domains", "domains": sorted(blocked_domains)})
+    return jsonify({"success": True})
+
+
+def _send(method, url, headers, body, source):
+    req = {
+        "id": next_id(),
+        "method": method,
+        "url": url,
+        "host": urlparse(url).netloc,
+        "headers": headers,
+        "body": body,
+        "timestamp": now_iso(),
+        "source": source,
+        "response": None,
+    }
+
+    domain = urlparse(url).netloc
+    if is_blocked(domain):
+        req["response"] = {"error": f"domain '{domain}' is blocked"}
+        record_request(req)
+        return req
+
+    try:
+        started = time.perf_counter()
+        resp = requests.request(
+            method=method, url=url, headers=headers,
+            data=body.encode("utf-8") if body else None, timeout=15,
+        )
+        elapsed_ms = round((time.perf_counter() - started) * 1000)
+        try:
+            body_out = resp.json()
+            is_json = True
+        except ValueError:
+            body_out = resp.text[:MAX_BODY_PREVIEW]
+            is_json = False
+        req["response"] = {
+            "status_code": resp.status_code,
+            "headers": dict(resp.headers),
+            "body": body_out,
+            "is_json": is_json,
+            "elapsed_ms": elapsed_ms,
+        }
+    except Exception as exc:
+        req["response"] = {"error": str(exc)}
+
+    record_request(req)
+    return req
+
+
+@app.post("/api/forge-request")
+def api_forge_request():
+    data = request.json or {}
+    url = data.get("url", "").strip()
+    if not url:
+        return jsonify({"error": "url is required"}), 400
+    if not url.startswith(("http://", "https://")):
+        url = "http://" + url
+    method = data.get("method", "GET").upper()
+    headers = data.get("headers") or {}
+    body = data.get("body", "")
+
+    req = _send(method, url, headers, body, source="forged")
+    return jsonify(req)
+
+
+@app.post("/api/request/<int:req_id>/repeat")
+def api_repeat_request(req_id):
+    """Repeater: resend a captured/forged request, optionally with edits."""
+    overrides = request.json or {}
+    with state_lock:
+        original = next((r for r in intercepted_requests if r["id"] == req_id), None)
+    if not original:
+        return jsonify({"error": "not found"}), 404
+
+    method = overrides.get("method", original["method"]).upper()
+    url = overrides.get("url", original["url"])
+    headers = overrides.get("headers", original.get("headers", {}))
+    body = overrides.get("body", original.get("body", ""))
+
+    if method == "CONNECT":
+        return jsonify({"error": "CONNECT tunnels can't be replayed; repeat the underlying request instead"}), 400
+
+    req = _send(method, url, headers, body, source="repeated")
+    return jsonify(req)
+
+
+def _to_curl(req):
+    parts = ["curl", "-i", "-X", req["method"], f"'{req['url']}'"]
+    for k, v in (req.get("headers") or {}).items():
+        if k.lower() in ("host", "content-length"):
+            continue
+        v_escaped = str(v).replace("'", "'\\''")
+        parts.append(f"-H '{k}: {v_escaped}'")
+    if req.get("body"):
+        body_escaped = req["body"].replace("'", "'\\''")
+        parts.append(f"--data-raw '{body_escaped}'")
+    return " \\\n  ".join(parts)
+
+
+@app.get("/api/request/<int:req_id>/curl")
+def api_request_curl(req_id):
+    with state_lock:
+        req = next((r for r in intercepted_requests if r["id"] == req_id), None)
+    if not req:
+        return jsonify({"error": "not found"}), 404
+    return jsonify({"curl": _to_curl(req)})
+
+
+if __name__ == "__main__":
+    init_db()
     flask_port = find_available_port(5000)
-    print(f"Web Request Inspector available at: http://127.0.0.1:{flask_port}")
-    app.run(host='127.0.0.1', port=flask_port)
+    banner = f"""
+  Interceptor — running at http://127.0.0.1:{flask_port}
+  Proxy is OFF by default — start it from the UI (or POST /api/toggle-proxy).
+"""
+    print(banner)
+    app.run(host="127.0.0.1", port=flask_port, debug=False)

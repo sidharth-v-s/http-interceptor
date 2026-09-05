@@ -1,271 +1,122 @@
-
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Web Request Inspector</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; }
-        .container { display: flex; }
-        .sidebar { width: 300px; padding-right: 20px; }
-        .main { flex-grow: 1; }
-        .request-list { height: 500px; overflow-y: auto; border: 1px solid #ccc; }
-        .request-item { padding: 10px; border-bottom: 1px solid #eee; cursor: pointer; }
-        .request-item:hover { background-color: #f5f5f5; }
-        .selected { background-color: #e0e0e0; }
-        .request-details { margin-top: 20px; border: 1px solid #ccc; padding: 10px; }
-        .blocked-domains { margin-top: 20px; }
-        .forge-form { margin-top: 20px; border: 1px solid #ccc; padding: 10px; }
-        textarea { width: 100%; height: 100px; }
-        .status { background-color: #f0f0f0; padding: 10px; margin: 10px 0; border-radius: 5px; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Interceptor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
 <body>
-    <h1>Web Request Inspector</h1>
-    <div class="status" id="proxyStatus">Proxy server status: Loading...</div>
-    
-    <div class="container">
-        <div class="sidebar">
-            <h2>Requests</h2>
-            <div class="request-list" id="requestList"></div>
-            
-            <div class="blocked-domains">
-                <h2>Blocked Domains</h2>
-                <form id="blockForm">
-                    <input type="text" id="domainInput" placeholder="example.com">
-                    <button type="submit">Block</button>
-                </form>
-                <ul id="blockedDomainsList"></ul>
-            </div>
-        </div>
-        
-        <div class="main">
-            <div class="request-details" id="requestDetails">
-                <p>Select a request to view details</p>
-            </div>
-            
-            <div class="forge-form">
-                <h2>Forge Request</h2>
-                <form id="forgeForm">
-                    <select id="method">
-                        <option value="GET">GET</option>
-                        <option value="POST">POST</option>
-                        <option value="PUT">PUT</option>
-                        <option value="DELETE">DELETE</option>
-                    </select>
-                    <input type="text" id="url" style="width: 100%;" placeholder="http://example.com/api">
-                    <textarea id="headers" placeholder='{"Content-Type": "application/json"}'></textarea>
-                    <textarea id="body" placeholder='{"key": "value"}'></textarea>
-                    <button type="submit">Send</button>
-                </form>
-                <div id="forgeResponse"></div>
-            </div>
-        </div>
+
+<div class="app">
+
+  <!-- Top bar -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">◈</span>
+      <span class="brand-name">Interceptor</span>
     </div>
-    
-    <script>
-        // Setup WebSocket for real-time updates
-        const ws = new WebSocket(`ws://${window.location.host}/ws`);
-        ws.onmessage = function(event) {
-            const data = JSON.parse(event.data);
-            if (data.type === 'request') {
-                addRequestToList(data.request);
-            } else if (data.type === 'blocked_domains') {
-                updateBlockedDomains(data.domains);
-            } else if (data.type === 'proxy_status') {
-                updateProxyStatus(data.status);
-            }
-        };
-        
-        // Fetch proxy status
-        function fetchProxyStatus() {
-            fetch('/api/proxy-status')
-                .then(response => response.json())
-                .then(data => updateProxyStatus(data));
-        }
-        
-        function updateProxyStatus(status) {
-            const statusDiv = document.getElementById('proxyStatus');
-            statusDiv.innerHTML = `Proxy server status: ${status.running ? 'Running' : 'Stopped'} 
-                                  ${status.running ? `on ${status.host}:${status.port}` : ''}
-                                  <button id="toggleProxy">${status.running ? 'Stop' : 'Start'}</button>`;
-            
-            document.getElementById('toggleProxy').onclick = () => toggleProxy(status.running);
-        }
-        
-        // Toggle proxy
-        function toggleProxy(isRunning) {
-            fetch('/api/toggle-proxy', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({action: isRunning ? 'stop' : 'start'})
-            })
-            .then(response => response.json())
-            .then(data => {
-                fetchProxyStatus();
-                alert(data.message);
-            });
-        }
-        
-        // Load initial requests
-        function loadRequests() {
-            fetch('/api/requests')
-                .then(response => response.json())
-                .then(data => {
-                    const requestList = document.getElementById('requestList');
-                    requestList.innerHTML = '';
-                    data.forEach(req => addRequestToList(req));
-                });
-        }
-        
-        function addRequestToList(req) {
-    const requestList = document.getElementById('requestList');
-    const item = document.createElement('div');
-    item.className = 'request-item fade-in';
-    
-    const methodSpan = document.createElement('span');
-    methodSpan.className = `request-method method-${req.method}`;
-    methodSpan.textContent = req.method;
-    
-    const urlSpan = document.createElement('span');
-    urlSpan.className = 'request-url';
-    urlSpan.textContent = req.url.substring(0, 30) + (req.url.length > 30 ? '...' : '');
-    
-    const timeSpan = document.createElement('span');
-    timeSpan.className = 'request-time';
-    timeSpan.textContent = req.timestamp.split(' ')[1]; // Just show time
-    
-    item.appendChild(methodSpan);
-    item.appendChild(urlSpan);
-    item.appendChild(timeSpan);
-    item.onclick = () => showRequestDetails(req.id);
-    
-    // Add to top of list
-    if (requestList.firstChild) {
-        requestList.insertBefore(item, requestList.firstChild);
-    } else {
-        requestList.appendChild(item);
-    }
-    
-    // Limit items
-    while (requestList.children.length > 100) {
-        requestList.removeChild(requestList.lastChild);
-    }
-}
-        
-        // Load blocked domains
-        function loadBlockedDomains() {
-            fetch('/api/blocked-domains')
-                .then(response => response.json())
-                .then(data => updateBlockedDomains(data));
-        }
-        
-        function updateBlockedDomains(domains) {
-            const list = document.getElementById('blockedDomainsList');
-            list.innerHTML = '';
-            
-            domains.forEach(domain => {
-                const item = document.createElement('li');
-                item.textContent = domain;
-                const removeBtn = document.createElement('button');
-                removeBtn.textContent = 'X';
-                removeBtn.onclick = (e) => {
-                    e.stopPropagation();
-                    unblockDomain(domain);
-                };
-                item.appendChild(removeBtn);
-                list.appendChild(item);
-            });
-        }
-        
-        // Show request details
-        function showRequestDetails(id) {
-            fetch(`/api/request/${id}`)
-                .then(response => response.json())
-                .then(req => {
-                    const detailsDiv = document.getElementById('requestDetails');
-                    detailsDiv.innerHTML = `
-                        <h3>${req.method} ${req.url}</h3>
-                        <p>${req.timestamp}</p>
-                        <h4>Headers:</h4>
-                        <pre>${JSON.stringify(req.headers, null, 2)}</pre>
-                        <h4>Body:</h4>
-                        <pre>${req.body || "(empty)"}</pre>
-                        <h4>Response:</h4>
-                        <pre>${JSON.stringify(req.response, null, 2)}</pre>
-                    `;
-                    
-                    document.querySelectorAll('.request-item').forEach(item => {
-                        item.classList.remove('selected');
-                    });
-                });
-        }
-        
-        // Block domain
-        document.getElementById('blockForm').addEventListener('submit', function(e) {
-            e.preventDefault();
-            const domain = document.getElementById('domainInput').value.trim();
-            if (domain) {
-                fetch('/api/block-domain', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({domain})
-                }).then(() => {
-                    document.getElementById('domainInput').value = '';
-                    loadBlockedDomains();
-                });
-            }
-        });
-        
-        // Unblock domain
-        function unblockDomain(domain) {
-            fetch('/api/unblock-domain', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({domain})
-            }).then(() => loadBlockedDomains());
-        }
-        
-        // Forge request
-        document.getElementById('forgeForm').addEventListener('submit', function(e) {
-            e.preventDefault();
-            const method = document.getElementById('method').value;
-            const url = document.getElementById('url').value;
-            let headers = {};
-            let body = '';
-            
-            try {
-                const headersText = document.getElementById('headers').value;
-                if (headersText) headers = JSON.parse(headersText);
-                
-                const bodyText = document.getElementById('body').value;
-                if (bodyText) body = bodyText;
-                
-                fetch('/api/forge-request', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({method, url, headers, body})
-                })
-                .then(response => response.json())
-                .then(data => {
-                    document.getElementById('forgeResponse').innerHTML = `
-                        <h3>Response:</h3>
-                        <pre>${JSON.stringify(data, null, 2)}</pre>
-                    `;
-                });
-            } catch (error) {
-                document.getElementById('forgeResponse').innerHTML = `
-                    <h3>Error:</h3>
-                    <pre>Invalid JSON: ${error.message}</pre>
-                `;
-            }
-        });
-        
-        // Initial load
-        fetchProxyStatus();
-        loadRequests();
-        loadBlockedDomains();
-    </script>
+
+    <div class="proxy-control" id="proxyControl">
+      <span class="proxy-dot" id="proxyDot"></span>
+      <span class="proxy-label" id="proxyLabel">checking proxy…</span>
+      <button class="btn btn-ghost" id="proxyToggleBtn">Start</button>
+    </div>
+
+    <div class="topbar-meta">
+      <span id="reqCount">0 requests</span>
+      <button class="btn btn-ghost" id="clearBtn" title="Clear all captured traffic">Clear</button>
+    </div>
+  </header>
+
+  <div class="workspace">
+
+    <!-- Left: traffic list -->
+    <aside class="pane pane-traffic">
+      <div class="pane-head">
+        <h2>Traffic</h2>
+      </div>
+      <div class="traffic-controls">
+        <input id="searchInput" type="text" placeholder="filter by url or host…" autocomplete="off">
+        <select id="methodFilter">
+          <option value="">all methods</option>
+          <option>GET</option>
+          <option>POST</option>
+          <option>PUT</option>
+          <option>PATCH</option>
+          <option>DELETE</option>
+          <option>CONNECT</option>
+        </select>
+      </div>
+      <div class="traffic-list" id="trafficList">
+        <div class="empty-state">No traffic captured yet.<br>Start the proxy, or use Forge to send a request.</div>
+      </div>
+    </aside>
+
+    <!-- Middle: request/response detail -->
+    <section class="pane pane-detail">
+      <div class="pane-head">
+        <h2>Detail</h2>
+        <div class="detail-actions" id="detailActions" hidden>
+          <button class="btn btn-ghost" id="sendToRepeaterBtn">Send to Repeater</button>
+          <button class="btn btn-ghost" id="copyCurlBtn">Copy as curl</button>
+        </div>
+      </div>
+      <div class="detail-body" id="detailBody">
+        <div class="empty-state">Select a request from the traffic list to inspect it.</div>
+      </div>
+    </section>
+
+    <!-- Right: tools (Repeater / Forge / Block rules) -->
+    <aside class="pane pane-tools">
+      <div class="tool-tabs">
+        <button class="tool-tab active" data-tool="repeater">Repeater</button>
+        <button class="tool-tab" data-tool="forge">Forge</button>
+        <button class="tool-tab" data-tool="rules">Block Rules</button>
+      </div>
+
+      <!-- Repeater / Forge share one form (Repeater just pre-fills it) -->
+      <div class="tool-panel" id="tool-repeater">
+        <form id="sendForm" class="send-form">
+          <div class="field-row">
+            <select id="sendMethod">
+              <option>GET</option>
+              <option>POST</option>
+              <option>PUT</option>
+              <option>PATCH</option>
+              <option>DELETE</option>
+              <option>HEAD</option>
+              <option>OPTIONS</option>
+            </select>
+            <input id="sendUrl" type="text" placeholder="https://target/api/endpoint" required>
+          </div>
+          <label class="field-label">Headers <span class="field-hint">JSON object</span></label>
+          <textarea id="sendHeaders" class="mono" rows="4" placeholder='{ "Content-Type": "application/json" }'></textarea>
+          <label class="field-label">Body</label>
+          <textarea id="sendBody" class="mono" rows="6" placeholder="request body, if any"></textarea>
+          <button type="submit" class="btn btn-primary">Send</button>
+        </form>
+        <div class="send-result" id="sendResult"></div>
+      </div>
+
+      <div class="tool-panel" id="tool-forge" hidden>
+        <p class="tool-hint">Forge builds a request from scratch and sends it directly — no proxy needed. Use Repeater (left tab) to replay something you already captured.</p>
+      </div>
+
+      <div class="tool-panel" id="tool-rules" hidden>
+        <form id="blockForm" class="field-row">
+          <input id="domainInput" type="text" placeholder="evil.example.com">
+          <button type="submit" class="btn btn-primary">Block</button>
+        </form>
+        <ul class="block-list" id="blockList"></ul>
+      </div>
+    </aside>
+
+  </div>
+</div>
+
+<script src="{{ url_for('static', filename='js/app.js') }}"></script>
 </body>
 </html>
-    
